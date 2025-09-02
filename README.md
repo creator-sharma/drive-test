@@ -16,7 +16,7 @@ It writes a large test file on your target drive (default `E:`), verifies integr
 - **Drive health (best-effort)**:
 
   - PowerShell: `Get-Disk` + `Get-StorageReliabilityCounter` (if available).
-  - `smartctl` (if **smartmontools** is installed and your USB bridge exposes SMART).
+  - SMART via `smartctl` (from **smartmontools**). The script auto-detects `smartctl` and, for USB enclosures, automatically retries with `-d sat` and `-d scsi`.
 
 The script **only writes** inside `E:\HDD_Test\` (or your chosen drive) and deletes the file by default (use `--keep` to retain it).
 
@@ -26,11 +26,12 @@ The script **only writes** inside `E:\HDD_Test\` (or your chosen drive) and dele
 
 - Windows 11
 - Python **3.12** or **3.13**
-- No external Python packages (uses standard library only)
+- No external Python packages (standard library only)
 
 **Optional (for SMART data):**
 
-- smartmontools
+- **smartmontools**
+
   Install with one of:
 
   ```bat
@@ -47,13 +48,13 @@ The script **only writes** inside `E:\HDD_Test\` (or your chosen drive) and dele
 
 ### Interactive mode (prompts for values)
 
-Just run the script with no flags:
+Run with no flags:
 
 ```bat
 py -3.13 "C:\Dev\Project_25\_scripts\drive-test\hdd_test.py"
 ```
 
-It will ask for:
+You’ll be prompted for:
 
 - Drive letter (default `E:`)
 - Test file size (GB)
@@ -62,7 +63,9 @@ It will ask for:
 - Random 4 KiB samples
 - Keep file after run?
 - Verify-only mode?
+- **(Verify-only)** Run random 4 KiB probe **before** sequential read? (recommended)
 - Test file name
+- Path to `smartctl.exe` (press Enter for auto-detect)
 
 ### Non-interactive (one-liner)
 
@@ -93,16 +96,14 @@ py -3.13 "C:\Dev\Project_25\_scripts\drive-test\hdd_test.py" --drive E: --size-g
 
 ### 2) More realistic **read** numbers (avoid OS cache)
 
-1. Create and **keep** a larger file:
+**Recommended:** keep a file, replug, then verify-only with random probe first.
 
 ```bat
+:: Create and keep a larger file
 py -3.13 "C:\Dev\Project_25\_scripts\drive-test\hdd_test.py" --drive E: --size-gb 4 --keep
-```
 
-2. Unplug/replug the drive (or reboot), then **verify-only**:
-
-```bat
-py -3.13 "C:\Dev\Project_25\_scripts\drive-test\hdd_test.py" --drive E: --verify-only
+:: Unplug/replug the drive (or reboot), then:
+py -3.13 "C:\Dev\Project_25\_scripts\drive-test\hdd_test.py" --drive E: --verify-only --random-first
 ```
 
 ### 3) Max sequential write (cheap data generation)
@@ -111,21 +112,35 @@ py -3.13 "C:\Dev\Project_25\_scripts\drive-test\hdd_test.py" --drive E: --verify
 py -3.13 "C:\Dev\Project_25\_scripts\drive-test\hdd_test.py" --drive E: --size-gb 2 --pattern zeros
 ```
 
+### 4) If `smartctl` isn’t on PATH
+
+You can pass the path explicitly:
+
+```bat
+py -3.13 "C:\Dev\Project_25\_scripts\drive-test\hdd_test.py" --smartctl "C:\Program Files\smartmontools\bin\smartctl.exe"
+```
+
+The script already auto-tries `-d sat` and `-d scsi` for USB bridges.
+
 ---
 
 ## Command reference
 
-| Flag               | Description                                | Default        |
-| ------------------ | ------------------------------------------ | -------------- |
-| `-d`, `--drive`    | Target drive letter (e.g., `E:`)           | `E:`           |
-| `--size-gb`        | Test file size in GB                       | `2.0`          |
-| `--chunk-mb`       | I/O chunk size in MB                       | `64`           |
-| `--pattern`        | Write pattern: `random` or `zeros`         | `random`       |
-| `--random-samples` | Number of random 4 KiB read probes         | `400`          |
-| `--keep`           | Keep the test file after run               | _off_          |
-| `--verify-only`    | Skip writing; only read/hash existing file | _off_          |
-| `--file-name`      | Test file name inside `HDD_Test` folder    | `testfile.bin` |
-| `--no-interactive` | Force non-interactive even if no args      | _off_          |
+| Flag               | Description                                                                      | Default        |
+| ------------------ | -------------------------------------------------------------------------------- | -------------- |
+| `-d`, `--drive`    | Target drive letter (e.g., `E:`)                                                 | `E:`           |
+| `--size-gb`        | Test file size in GB                                                             | `2.0`          |
+| `--chunk-mb`       | I/O chunk size in MB                                                             | `64`           |
+| `--pattern`        | Write pattern: `random` or `zeros`                                               | `random`       |
+| `--random-samples` | Number of random 4 KiB read probes                                               | `400`          |
+| `--keep`           | Keep the test file after run                                                     | off            |
+| `--verify-only`    | Skip writing; only read/hash existing file                                       | off            |
+| `--random-first`   | _(Verify-only)_ run random probe **before** the sequential read (more realistic) | off†           |
+| `--file-name`      | Test file name inside `HDD_Test` folder                                          | `testfile.bin` |
+| `--smartctl`       | Path to `smartctl.exe` (auto-detected if omitted)                                | —              |
+| `--no-interactive` | Force non-interactive even with no args                                          | off            |
+
+† When you use **verify-only**, the script defaults `--random-first` to **on**, unless you explicitly set it otherwise.
 
 ---
 
@@ -138,17 +153,18 @@ py -3.13 "C:\Dev\Project_25\_scripts\drive-test\hdd_test.py" --drive E: --size-g
 
 - **Sequential speeds (MB/s)**
 
-  - Typical USB 3.x external HDD: \~**100–200 MB/s** write/read.
+  - Typical USB 3.x external HDD: **\~100–200 MB/s** write/read.
   - Much lower may mean USB 2.0 port/cable, hub bottleneck, or background activity.
 
 - **Random 4 KiB reads**
 
   - HDDs are inherently slow at small random reads (milliseconds).
+  - **Uncached** HDD numbers often look like **\~8–15 ms avg**, **\~12–25 ms p95**, low MB/s (\~0.3–0.6).
   - If you see **\~0.01–0.05 ms** latency and **hundreds of MB/s**, that’s **OS cache**. Use the “realistic read” workflow above.
 
 - **SMART / Reliability counters**
 
-  - Ideal problematic attributes should be **0**:
+  - Attributes that should be **0**:
 
     - Reallocated Sectors **(ID 5)**
     - Reported Uncorrectable **(ID 187)**
@@ -171,8 +187,8 @@ py -3.13 "C:\Dev\Project_25\_scripts\drive-test\hdd_test.py" --drive E: --size-g
 ## Troubleshooting
 
 - **“Not enough free space”** → reduce `--size-gb` or free space.
-- **“smartctl not found”** → install smartmontools (see above), reopen terminal.
-- **“Reliability counters not available”** → try an **elevated** PowerShell; some USB bridges simply don’t expose them.
+- **“smartctl not found”** → install smartmontools (see above), reopen terminal, or pass `--smartctl "C:\...\smartctl.exe"`.
+- **“Reliability counters not available”** → try an **elevated** PowerShell; many USB bridges simply don’t expose them.
 - **Very slow writes** → confirm a USB 3.x port/cable; avoid hubs; try a different port/cable.
 - **AV interference** → real-time antivirus can slow hashing/writes; temporarily exclude the `HDD_Test` folder if needed.
 
@@ -181,28 +197,52 @@ py -3.13 "C:\Dev\Project_25\_scripts\drive-test\hdd_test.py" --drive E: --size-g
 ## Example output (trimmed)
 
 ```
-=== External HDD Test v1.3.0 ===
+=== External HDD Test v1.4.0 ===
 [CONF ] Target drive: E: | size: 2.0 GB | chunk: 64 MB | pattern: random
-[INFO ] E:\  Total: 465.76 GB  Free: 465.65 GB  Used: 110.70 MB
+[INFO ] E:\  Total: 465.76 GB  Free: 463.65 GB  Used: 2.11 GB
 [PS   ] Get-Disk details:
-Number : 1
-...
-[WRITE] Wrote 2.00 GB in 24.9s → 82.4 MB/s
-[READ ] Read 2.00 GB in 3.9s  → 521.8 MB/s
-[HASH ] Expected: <hash>
-[HASH ]   Actual: <hash>
-[OK   ] Read-after-write checksum matches ✅
-[RAND ] 4KiB reads: avg 0.01 ms, p95 0.02 ms, ~401 MB/s over 400 samples
+Number       : 1
+FriendlyName : Innostor Ext. HDD
+Model        : Ext. HDD
+BusType      : USB
+HealthStatus : Healthy
+Size         : 500107862016
+[SMART] smartctl on E: (key lines):
+SMART overall-health self-assessment test result: PASSED
+5 Reallocated_Sector_Ct ... 0
+197 Current_Pending_Sector ... 0
+198 Offline_Uncorrectable ... 0
+199 UDMA_CRC_Error_Count ... 0
+[MODE ] Verify-only: will hash existing file.
+[RAND ] 4KiB reads (pre-read): avg 10.09 ms, p95 15.17 ms, ~0.39 MB/s over 400 samples
+[READ ] Reading & hashing 2.00 GB from E:\HDD_Test\testfile.bin
+[READ ] Read 2.00 GB in 21.09s  →  97.1 MB/s
 ```
 
-> Note: The very fast read/latency numbers above indicate **OS caching**. Use the verify-only workflow after a replug/reboot for realistic reads.
+> Note: Running the **random probe before** the big sequential read keeps results uncached and HDD-realistic.
 
 ---
 
 ## Version
 
-Script version: **1.3.0**
+Script version: **1.4.0**
 No external dependencies.
-You can always see available flags with `-h`.
+See available flags with `-h`.
+
+---
+
+## (Optional) SMART self-tests
+
+You can trigger on-drive diagnostics (the script doesn’t run these automatically):
+
+```powershell
+# Most USB enclosures: use -d sat
+smartctl -t short -d sat \\.\PhysicalDrive1
+# Later, view results:
+smartctl -l selftest -d sat \\.\PhysicalDrive1
+
+# Long/offline test (takes hours on HDDs)
+smartctl -t long -d sat \\.\PhysicalDrive1
+```
 
 ---

@@ -9,10 +9,9 @@ What it does:
   • Random 4KiB read probes (avg / p95 latency, rough throughput)
   • Best-effort disk health:
         - PowerShell: Get-Disk / Get-StorageReliabilityCounter (if available)
-        - smartctl (smartmontools) if installed (and USB bridge exposes SMART)
+        - smartctl (smartmontools) if installed; auto-tries -d sat / -d scsi for USB enclosures
 
-Run with no arguments for interactive prompts, or pass flags for unattended use.
-It only writes inside a test folder and cleans up by default (use --keep to retain).
+Interactive prompts if you run with no arguments. Writes only inside HDD_Test and cleans up by default.
 """
 
 import argparse
@@ -26,7 +25,7 @@ import sys
 import time
 from typing import Dict, Optional, Tuple
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 # ---------------------------- helpers ----------------------------
 
@@ -134,54 +133,102 @@ def powershell_disk_health(drive_letter: str) -> Optional[int]:
     return disk_number
 
 
-def smartctl_summary(drive_letter: str, disk_number_hint: Optional[int]) -> None:
-    """Try smartctl. Prefers PhysicalDriveN if we know N."""
-    candidates = []
-    if isinstance(disk_number_hint, int):
-        candidates.append(rf"\\.\PhysicalDrive{disk_number_hint}")
-    drv = drive_letter.upper().rstrip("\\/")
-    candidates.append(drv if drv.endswith(":") else (drv + ":"))
+# ---------- smartctl helpers (auto-discovery and USB device type retries) ----------
 
-    for target in candidates:
-        try:
-            out = subprocess.check_output(
-                ["smartctl", "-a", target], text=True, stderr=subprocess.STDOUT
-            )
-            print(f"[SMART] smartctl on {target} (key lines):")
-            key_lines = []
-            for line in out.splitlines():
-                lat = line.strip()
-                if any(
-                    k in lat
-                    for k in [
-                        "SMART overall-health",
-                        "SMART Health Status",
-                        "Reallocated_Sector_Ct",
-                        "Reallocated Sector Count",
-                        "Current_Pending_Sector",
-                        "Current Pending Sector",
-                        "Offline_Uncorrectable",
-                        "UDMA_CRC_Error_Count",
-                        "Reported_Uncorrect",
-                        "Temperature_Celsius",
-                        "Temperature",
-                    ]
-                ):
-                    key_lines.append(lat)
-            if key_lines:
-                print("\n".join(key_lines[:60]))
-            else:
-                print("(smartctl ran; no standard attributes recognized in output)")
-            return
-        except FileNotFoundError:
-            print(
-                "[SMART] smartctl not found. Install smartmontools to view detailed SMART."
-            )
-            return
-        except subprocess.CalledProcessError as e:
-            msg = e.output.strip()
-            print(f"[SMART] smartctl error on {target}: {msg[:300]}")
-            continue
+
+def find_smartctl(user_path: Optional[str] = None) -> Optional[str]:
+    # 1) explicit path
+    if user_path and os.path.exists(user_path):
+        return user_path
+    # 2) PATH
+    try:
+        import shutil as _shutil
+
+        p = _shutil.which("smartctl")
+        if p:
+            return p
+    except Exception:
+        pass
+    # 3) common install locations
+    candidates = []
+    pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+    pfx86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+    candidates.append(os.path.join(pf, "smartmontools", "bin", "smartctl.exe"))
+    candidates.append(os.path.join(pfx86, "smartmontools", "bin", "smartctl.exe"))
+    candidates.append(r"C:\ProgramData\chocolatey\bin\smartctl.exe")
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    return None
+
+
+def smartctl_summary(
+    drive_letter: str,
+    disk_number_hint: Optional[int],
+    smartctl_path: Optional[str] = None,
+) -> None:
+    sc = find_smartctl(smartctl_path)
+    if not sc:
+        print(
+            "[SMART] smartctl not found. Install smartmontools or add it to PATH, or pass --smartctl <path>."
+        )
+        return
+
+    # Prefer PhysicalDriveN, then drive letter
+    targets = []
+    if isinstance(disk_number_hint, int):
+        targets.append(rf"\\.\PhysicalDrive{disk_number_hint}")
+    drv = drive_letter.upper().rstrip("\\/")
+    targets.append(drv if drv.endswith(":") else (drv + ":"))
+
+    def _run(args):
+        return subprocess.check_output([sc] + args, text=True, stderr=subprocess.STDOUT)
+
+    # For each target, try plain, then -d sat, then -d scsi
+    for target in targets:
+        for extra in ([], ["-d", "sat"], ["-d", "scsi"]):
+            try:
+                args = ["-a", target] + extra
+                out = _run(args)
+                trail = f" {' '.join(extra)}" if extra else ""
+                print(f"[SMART] smartctl on {target}{trail} (key lines):")
+                key_lines = []
+                for line in out.splitlines():
+                    lat = line.strip()
+                    if any(
+                        k in lat
+                        for k in [
+                            "SMART overall-health",
+                            "SMART Health Status",
+                            "Reallocated_Sector_Ct",
+                            "Reallocated Sector Count",
+                            "Current_Pending_Sector",
+                            "Current Pending Sector",
+                            "Offline_Uncorrectable",
+                            "UDMA_CRC_Error_Count",
+                            "Reported_Uncorrect",
+                            "Temperature_Celsius",
+                            "Temperature",
+                        ]
+                    ):
+                        key_lines.append(lat)
+                print(
+                    "\n".join(key_lines[:60])
+                    if key_lines
+                    else "(Ran; no standard attributes detected)"
+                )
+                return
+            except subprocess.CalledProcessError:
+                # Keep trying next mode
+                continue
+            except Exception:
+                continue
+    print(
+        "[SMART] Could not read SMART via common methods (USB bridge may hide it). Try running as admin or a different enclosure."
+    )
+
+
+# -------------------------- I/O workers --------------------------
 
 
 def write_test_file(
@@ -200,10 +247,7 @@ def write_test_file(
     with open(path, "wb", buffering=0) as f:
         while wrote < total_bytes:
             n = min(chunk_size, total_bytes - wrote)
-            if pattern == "zeros":
-                buf = bytes(n)
-            else:
-                buf = os.urandom(n)
+            buf = bytes(n) if pattern == "zeros" else os.urandom(n)
             f.write(buf)
             h.update(buf)
             wrote += n
@@ -374,9 +418,16 @@ def interactive_config(defaults: argparse.Namespace) -> argparse.Namespace:
         "Verify-only (skip writing; only read/hash existing file)?",
         defaults.verify_only,
     )
+    random_first = defaults.random_first
+    if verify_only:
+        random_first = _prompt_yes_no(
+            "Run random 4KiB probe BEFORE sequential read (more realistic)?", True
+        )
     file_name = _prompt("Test file name", defaults.file_name)
+    smartctl_path = _prompt(
+        "Path to smartctl.exe (Enter to auto-detect)", defaults.smartctl or ""
+    )
 
-    # Pack into a namespace matching argparse
     ns = argparse.Namespace(
         drive=drive,
         size_gb=size_gb,
@@ -385,7 +436,9 @@ def interactive_config(defaults: argparse.Namespace) -> argparse.Namespace:
         random_samples=random_samples,
         keep=keep,
         verify_only=verify_only,
+        random_first=random_first,
         file_name=file_name,
+        smartctl=(smartctl_path if smartctl_path else None),
     )
     return ns
 
@@ -422,10 +475,16 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Do NOT write; only read & verify existing file if present",
     )
     ap.add_argument(
+        "--random-first",
+        action="store_true",
+        help="(Verify-only) run random 4KiB probe BEFORE sequential read",
+    )
+    ap.add_argument(
         "--file-name",
         default="testfile.bin",
         help="Name of test file (default: testfile.bin)",
     )
+    ap.add_argument("--smartctl", help="Path to smartctl.exe (optional)")
     ap.add_argument(
         "--no-interactive",
         action="store_true",
@@ -437,12 +496,17 @@ def build_argparser() -> argparse.ArgumentParser:
 def main():
     ap = build_argparser()
 
-    # If no CLI args (just the script), drop into interactive prompts unless --no-interactive is given.
+    # If no CLI args, drop into interactive prompts unless --no-interactive is given.
     if len(sys.argv) == 1:
         defaults = ap.parse_args([])  # get defaults
+        # In verify-only, random-first is a good default
+        defaults.random_first = True
         args = interactive_config(defaults)
     else:
         args = ap.parse_args()
+        # If verify-only and user didn't specify --random-first, we default it to True
+        if args.verify_only and "--random-first" not in sys.argv:
+            args.random_first = True
 
     print(f"=== External HDD Test v{__version__} ===")
     print(
@@ -460,7 +524,7 @@ def main():
     disk_number = powershell_disk_health(args.drive)
 
     # smartctl (if present)
-    smartctl_summary(args.drive, disk_number)
+    smartctl_summary(args.drive, disk_number, args.smartctl)
 
     # Ensure enough free space for write step (unless verify-only)
     if not args.verify_only:
@@ -476,17 +540,43 @@ def main():
             raise SystemExit(
                 f"[ERR  ] {test_path} not found. Run once without --verify-only (use --keep) to create it."
             )
-        print("[MODE ] Verify-only: skipping write; hashing existing file.")
-        exp_hash = None
-        w_speed = 0.0
+        print("[MODE ] Verify-only: will hash existing file.")
+        rr = None
+        # Run random probe BEFORE sequential read if requested
+        if args.random_first:
+            rr = random_reads(test_path, samples=args.random_samples, block_size=4096)
+            if rr:
+                print(
+                    f"[RAND ] 4KiB reads (pre-read): avg {rr['avg_ms']:.2f} ms, p95 {rr['p95_ms']:.2f} ms, ~{rr['throughput_mb_s']:.2f} MB/s over {rr['samples']} samples"
+                )
+            else:
+                print("[RAND ] Random-read probe skipped/insufficient data")
+
+        # Now do the sequential read+hash
+        got_hash, r_speed = read_verify(test_path, args.chunk_mb)
+
+        # If we didn't run random first, do it now (will likely be cached)
+        if rr is None:
+            rr = random_reads(test_path, samples=args.random_samples, block_size=4096)
+            if rr:
+                print(
+                    f"[RAND ] 4KiB reads: avg {rr['avg_ms']:.2f} ms, p95 {rr['p95_ms']:.2f} ms, ~{rr['throughput_mb_s']:.2f} MB/s over {rr['samples']} samples"
+                )
+            else:
+                print("[RAND ] Random-read probe skipped/insufficient data")
+
+        # Cache heuristic notice
+        if rr and rr.get("avg_ms", 0) < 0.15:
+            print(
+                "\n[NOTE ] Extremely low random latencies suggest results may be cached by Windows."
+            )
+
     else:
         exp_hash, w_speed = write_test_file(
             test_path, args.size_gb, args.chunk_mb, args.pattern
         )
+        got_hash, r_speed = read_verify(test_path, args.chunk_mb)
 
-    got_hash, r_speed = read_verify(test_path, args.chunk_mb)
-
-    if exp_hash is not None:
         print(f"[HASH ] Expected: {exp_hash}")
         print(f"[HASH ]   Actual: {got_hash}")
         if exp_hash == got_hash:
@@ -496,27 +586,26 @@ def main():
                 "[FAIL ] Checksum mismatch ❌  (STOP using this drive; data corruption detected)"
             )
 
-    rr = random_reads(test_path, samples=args.random_samples, block_size=4096)
-    if rr:
-        print(
-            f"[RAND ] 4KiB reads: avg {rr['avg_ms']:.2f} ms, p95 {rr['p95_ms']:.2f} ms, ~{rr['throughput_mb_s']:.2f} MB/s over {rr['samples']} samples"
-        )
-    else:
-        print("[RAND ] Random-read probe skipped/insufficient data")
+        rr = random_reads(test_path, samples=args.random_samples, block_size=4096)
+        if rr:
+            print(
+                f"[RAND ] 4KiB reads: avg {rr['avg_ms']:.2f} ms, p95 {rr['p95_ms']:.2f} ms, ~{rr['throughput_mb_s']:.2f} MB/s over {rr['samples']} samples"
+            )
+        else:
+            print("[RAND ] Random-read probe skipped/insufficient data")
 
-    # Heuristic hint if results look cached
-    if exp_hash is not None and looks_cached(w_speed, r_speed, rr):
-        print("\n[NOTE ] Your read/latency results look heavily OS-cached.")
-        print("        For more realistic read numbers, try one of these:")
-        print("          1) Re-run with a larger file (e.g., --size-gb 8 or 16), or")
-        print(
-            "          2) Run once with --keep, unplug/replug the drive, then run with --verify-only, or"
-        )
-        print("          3) Reboot and run with --verify-only on the existing file.")
-    elif exp_hash is None and rr and rr.get("avg_ms", 0) < 0.15:
-        print(
-            "\n[NOTE ] Extremely low random latencies suggest results may still be cached by Windows."
-        )
+        if looks_cached(w_speed, r_speed, rr):
+            print("\n[NOTE ] Your read/latency results look heavily OS-cached.")
+            print("        For more realistic read numbers, try one of these:")
+            print(
+                "          1) Re-run with a larger file (e.g., --size-gb 8 or 16), or"
+            )
+            print(
+                "          2) Run once with --keep, unplug/replug the drive, then run with --verify-only --random-first, or"
+            )
+            print(
+                "          3) Reboot and run with --verify-only --random-first on the existing file."
+            )
 
     if not args.keep and not args.verify_only:
         try:
