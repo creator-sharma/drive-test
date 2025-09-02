@@ -11,21 +11,24 @@ What it does:
         - PowerShell: Get-Disk / Get-StorageReliabilityCounter (if available)
         - smartctl (smartmontools) if installed (and USB bridge exposes SMART)
 
+Run with no arguments for interactive prompts, or pass flags for unattended use.
 It only writes inside a test folder and cleans up by default (use --keep to retain).
 """
 
-import os
-import sys
-import time
 import argparse
 import hashlib
-import shutil
+import os
 import random
+import shutil
 import statistics
 import subprocess
-from typing import Optional, Dict, Tuple
+import sys
+import time
+from typing import Dict, Optional, Tuple
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
+
+# ---------------------------- helpers ----------------------------
 
 
 def human_bytes(n: float) -> str:
@@ -280,9 +283,119 @@ def looks_cached(
     return False
 
 
-def main():
+# ----------------------- interactive prompts -----------------------
+
+
+def _prompt(text: str, default: Optional[str] = None) -> str:
+    if default is None:
+        return input(text).strip()
+    else:
+        s = input(f"{text} [{default}]: ").strip()
+        return s if s else default
+
+
+def _prompt_yes_no(text: str, default: bool = False) -> bool:
+    d = "Y/n" if default else "y/N"
+    while True:
+        s = input(f"{text} ({d}): ").strip().lower()
+        if not s:
+            return default
+        if s in ("y", "yes"):
+            return True
+        if s in ("n", "no"):
+            return False
+        print("Please answer y or n.")
+
+
+def interactive_config(defaults: argparse.Namespace) -> argparse.Namespace:
+    print("\n--- Interactive Mode ---")
+    # Drive
+    while True:
+        drive = _prompt("Drive letter (like E:)", defaults.drive)
+        try:
+            root = check_drive_root(drive)
+            break
+        except SystemExit as e:
+            print(str(e))
+
+    # Disk info for context
+    total, used, free = shutil.disk_usage(root)
+    free_gb = free / (1024**3)
+    print(f"Detected {root} with ~{free_gb:.2f} GB free.")
+
+    # Size GB (ensure it fits)
+    while True:
+        try:
+            size_gb = float(_prompt("Test file size in GB", str(defaults.size_gb)))
+        except ValueError:
+            print("Enter a number (e.g., 2 or 4.5).")
+            continue
+        need = int(size_gb * (1024**3)) + (128 * 1024**2)
+        if need > free:
+            print(
+                f"That's too large for the free space. Max suggested ≲ {max(0.0, free_gb - 0.2):.2f} GB."
+            )
+            continue
+        break
+
+    # Chunk MB
+    while True:
+        try:
+            chunk_mb = int(_prompt("I/O chunk size in MB", str(defaults.chunk_mb)))
+            if chunk_mb <= 0:
+                raise ValueError
+            break
+        except ValueError:
+            print("Enter a positive integer (e.g., 64).")
+
+    # Pattern
+    while True:
+        pattern = _prompt(
+            "Write pattern: 'random' or 'zeros'", defaults.pattern
+        ).lower()
+        if pattern in ("random", "zeros"):
+            break
+        print("Please type 'random' or 'zeros'.")
+
+    # Random samples
+    while True:
+        try:
+            random_samples = int(
+                _prompt("Random 4KiB read samples", str(defaults.random_samples))
+            )
+            if random_samples <= 0:
+                raise ValueError
+            break
+        except ValueError:
+            print("Enter a positive integer (e.g., 400).")
+
+    keep = _prompt_yes_no("Keep the test file after run?", defaults.keep)
+    verify_only = _prompt_yes_no(
+        "Verify-only (skip writing; only read/hash existing file)?",
+        defaults.verify_only,
+    )
+    file_name = _prompt("Test file name", defaults.file_name)
+
+    # Pack into a namespace matching argparse
+    ns = argparse.Namespace(
+        drive=drive,
+        size_gb=size_gb,
+        chunk_mb=chunk_mb,
+        pattern=pattern,
+        random_samples=random_samples,
+        keep=keep,
+        verify_only=verify_only,
+        file_name=file_name,
+    )
+    return ns
+
+
+# ------------------------------- main -------------------------------
+
+
+def build_argparser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
-        description="External HDD sanity + performance test (Windows)"
+        description="External HDD sanity + performance test (Windows)", add_help=True
     )
     ap.add_argument("-d", "--drive", default="E:", help="Drive letter like E:")
     ap.add_argument(
@@ -313,7 +426,23 @@ def main():
         default="testfile.bin",
         help="Name of test file (default: testfile.bin)",
     )
-    args = ap.parse_args()
+    ap.add_argument(
+        "--no-interactive",
+        action="store_true",
+        help="Force non-interactive even if no args provided",
+    )
+    return ap
+
+
+def main():
+    ap = build_argparser()
+
+    # If no CLI args (just the script), drop into interactive prompts unless --no-interactive is given.
+    if len(sys.argv) == 1:
+        defaults = ap.parse_args([])  # get defaults
+        args = interactive_config(defaults)
+    else:
+        args = ap.parse_args()
 
     print(f"=== External HDD Test v{__version__} ===")
     print(
@@ -349,6 +478,7 @@ def main():
             )
         print("[MODE ] Verify-only: skipping write; hashing existing file.")
         exp_hash = None
+        w_speed = 0.0
     else:
         exp_hash, w_speed = write_test_file(
             test_path, args.size_gb, args.chunk_mb, args.pattern
