@@ -15,8 +15,10 @@ It writes a large test file on your target drive (default `E:`), verifies integr
 - **Random I/O**: 4 KiB random read latency (avg / p95) and throughput.
 - **Drive health (best-effort)**:
 
-  - PowerShell: `Get-Disk` + `Get-StorageReliabilityCounter` (if available).
+  - PowerShell: `Get-Disk` + `Get-StorageReliabilityCounter` (if available; often needs Admin).
   - SMART via `smartctl` (from **smartmontools**). The script auto-detects `smartctl` and, for USB enclosures, automatically retries with `-d sat` and `-d scsi`.
+
+- **Run logging**: JSON Lines via `--report-json <path>`; easy to append & analyze later.
 
 The script **only writes** inside `E:\HDD_Test\` (or your chosen drive) and deletes the file by default (use `--keep` to retain it).
 
@@ -66,6 +68,10 @@ You’ll be prompted for:
 - **(Verify-only)** Run random 4 KiB probe **before** sequential read? (recommended)
 - Test file name
 - Path to `smartctl.exe` (press Enter for auto-detect)
+- **Save results to JSON** (path or `y` for default)
+
+> If you answer `y` at the JSON prompt, logs are saved to
+> `…\hdd_runs_<DRIVE>.jsonl` in the script folder (e.g., `hdd_runs_E.jsonl`).
 
 ### Non-interactive (one-liner)
 
@@ -83,6 +89,48 @@ py -3.13 "C:\Dev\Project_25\_scripts\drive-test\hdd_test.py" -h
 
 ---
 
+## Logging & history (JSONL)
+
+Use `--report-json` to append one JSON object per run (newline-delimited):
+
+- Default file in script folder:
+
+  ```bat
+  py -3.13 "...hdd_test.py" --report-json y
+  ```
+
+  Saves to `...\hdd_runs_E.jsonl` (drive letter included in the name).
+
+- Custom folder or file:
+
+  ```bat
+  :: folder -> uses default file name inside it
+  py -3.13 "...hdd_test.py" --report-json "C:\logs"
+  :: explicit file
+  py -3.13 "...hdd_test.py" --report-json "C:\logs\my_runs.jsonl"
+  ```
+
+**Read JSONL quickly**
+
+PowerShell (last run, pretty table):
+
+```powershell
+$last = Get-Content "C:\Dev\Project_25\_scripts\drive-test\hdd_runs_E.jsonl" -Tail 1 | ConvertFrom-Json
+$last | Select-Object timestamp_local, drive, mode,
+  @{n='read_MBps';e={$_.read.mb_per_s}},
+  @{n='rand_avg_ms';e={$_.random_read.avg_ms}},
+  @{n='smart_overall';e={$_.smart.overall}} | Format-Table -Auto
+```
+
+Convert JSONL → one JSON array:
+
+```powershell
+(Get-Content "...\hdd_runs_E.jsonl" | ForEach-Object { $_ | ConvertFrom-Json }) |
+  ConvertTo-Json -Depth 6 | Out-File "...\hdd_runs_E.json"
+```
+
+---
+
 ## Common workflows
 
 ### 1) Standard sanity test (fast)
@@ -96,14 +144,14 @@ py -3.13 "C:\Dev\Project_25\_scripts\drive-test\hdd_test.py" --drive E: --size-g
 
 ### 2) More realistic **read** numbers (avoid OS cache)
 
-**Recommended:** keep a file, replug, then verify-only with random probe first.
+**Recommended:** keep a file, **replug**, then verify-only with random probe first.
 
 ```bat
 :: Create and keep a larger file
 py -3.13 "C:\Dev\Project_25\_scripts\drive-test\hdd_test.py" --drive E: --size-gb 4 --keep
 
-:: Unplug/replug the drive (or reboot), then:
-py -3.13 "C:\Dev\Project_25\_scripts\drive-test\hdd_test.py" --drive E: --verify-only --random-first
+:: Safely eject + unplug/replug the drive (or reboot), then:
+py -3.13 "C:\Dev\Project_25\_scripts\drive-test\hdd_test.py" --drive E: --verify-only --random-first --report-json y
 ```
 
 ### 3) Max sequential write (cheap data generation)
@@ -114,13 +162,11 @@ py -3.13 "C:\Dev\Project_25\_scripts\drive-test\hdd_test.py" --drive E: --size-g
 
 ### 4) If `smartctl` isn’t on PATH
 
-You can pass the path explicitly:
-
 ```bat
 py -3.13 "C:\Dev\Project_25\_scripts\drive-test\hdd_test.py" --smartctl "C:\Program Files\smartmontools\bin\smartctl.exe"
 ```
 
-The script already auto-tries `-d sat` and `-d scsi` for USB bridges.
+(USB bridges are auto-tried with `-d sat` and `-d scsi`.)
 
 ---
 
@@ -138,6 +184,7 @@ The script already auto-tries `-d sat` and `-d scsi` for USB bridges.
 | `--random-first`   | _(Verify-only)_ run random probe **before** the sequential read (more realistic) | off†           |
 | `--file-name`      | Test file name inside `HDD_Test` folder                                          | `testfile.bin` |
 | `--smartctl`       | Path to `smartctl.exe` (auto-detected if omitted)                                | —              |
+| `--report-json`    | Append JSON Lines to file (e.g., `y`, a folder, or an explicit `.jsonl`)         | off            |
 | `--no-interactive` | Force non-interactive even with no args                                          | off            |
 
 † When you use **verify-only**, the script defaults `--random-first` to **on**, unless you explicitly set it otherwise.
@@ -172,7 +219,7 @@ The script already auto-tries `-d sat` and `-d scsi` for USB bridges.
     - Offline Uncorrectable **(ID 198)**
 
   - **UDMA CRC Error Count (ID 199)** should be **0**—non-zero often means a bad USB cable/port.
-  - `Get-StorageReliabilityCounter` may require **admin** and many USB bridges don’t expose it; that’s normal.
+  - `Get-StorageReliabilityCounter` may require **Admin**, and many USB bridges don’t expose it (normal).
 
 ---
 
@@ -197,7 +244,7 @@ The script already auto-tries `-d sat` and `-d scsi` for USB bridges.
 ## Example output (trimmed)
 
 ```
-=== External HDD Test v1.4.0 ===
+=== External HDD Test v1.5.0 ===
 [CONF ] Target drive: E: | size: 2.0 GB | chunk: 64 MB | pattern: random
 [INFO ] E:\  Total: 465.76 GB  Free: 463.65 GB  Used: 2.11 GB
 [PS   ] Get-Disk details:
@@ -214,9 +261,10 @@ SMART overall-health self-assessment test result: PASSED
 198 Offline_Uncorrectable ... 0
 199 UDMA_CRC_Error_Count ... 0
 [MODE ] Verify-only: will hash existing file.
-[RAND ] 4KiB reads (pre-read): avg 10.09 ms, p95 15.17 ms, ~0.39 MB/s over 400 samples
+[RAND ] 4KiB reads (pre-read): avg 10.1 ms, p95 15.2 ms, ~0.39 MB/s over 400 samples
 [READ ] Reading & hashing 2.00 GB from E:\HDD_Test\testfile.bin
-[READ ] Read 2.00 GB in 21.09s  →  97.1 MB/s
+[READ ] Read 2.00 GB in 21.1s  →  97.1 MB/s
+[REPORT] Appended JSON to ...\hdd_runs_E.jsonl
 ```
 
 > Note: Running the **random probe before** the big sequential read keeps results uncached and HDD-realistic.
@@ -225,7 +273,7 @@ SMART overall-health self-assessment test result: PASSED
 
 ## Version
 
-Script version: **1.4.0**
+Script version: **1.5.0**
 No external dependencies.
 See available flags with `-h`.
 

@@ -808,7 +808,7 @@ def main():
         " - SMART IDs to watch if smartctl works: 5, 187, 197, 198 should be 0; 199>0 often means bad USB cable/port."
     )
     print(
-        " - Typical USB 3.x external HDD seq speeds: ~100–200 MB/s. Much lower may indicate USB 2.0 or cabling issues."
+        " - Typical USB 3.x external HDD seq speeds: ~100-200 MB/s. Much lower may indicate USB 2.0 or cabling issues."
     )
 
 
