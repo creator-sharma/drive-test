@@ -10,14 +10,18 @@ What it does:
   • Best-effort disk health:
         - PowerShell: Get-Disk / Get-StorageReliabilityCounter (if available)
         - smartctl (smartmontools) if installed; auto-tries -d sat / -d scsi for USB enclosures
+  • JSON report via --report-json <path> (JSON Lines)
 
 Interactive prompts if you run with no arguments. Writes only inside HDD_Test and cleans up by default.
 """
 
 import argparse
 import hashlib
+import json
 import os
+import platform
 import random
+import re
 import shutil
 import statistics
 import subprocess
@@ -25,7 +29,7 @@ import sys
 import time
 from typing import Dict, Optional, Tuple
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 # ---------------------------- helpers ----------------------------
 
@@ -80,12 +84,41 @@ def _run_powershell(cmd: str) -> Optional[str]:
         return None
 
 
-def powershell_disk_health(drive_letter: str) -> Optional[int]:
-    """Print PowerShell health and return the PhysicalDrive number if found."""
+def _parse_ps_kv_block(block: str) -> Dict[str, Optional[int]]:
+    """Parse 'Key : Value' lines; convert numeric strings to int, empty -> None."""
+    result: Dict[str, Optional[int]] = {}
+    if not block:
+        return result
+    for line in block.splitlines():
+        if ":" not in line:
+            continue
+        key, val = line.split(":", 1)
+        key = key.strip()
+        val = val.strip()
+        if val == "":
+            result[key] = None
+        else:
+            try:
+                result[key] = int(val)
+            except ValueError:
+                # try float -> int if looks like number, else keep as string
+                try:
+                    fv = float(val)
+                    result[key] = int(fv)
+                except Exception:
+                    # keep raw strin
+                    result[key] = val  # pyright: ignore[reportArgumentType]
+    return result
+
+
+def powershell_disk_health(
+    drive_letter: str,
+) -> Tuple[Optional[int], Dict[str, Optional[int]]]:
+    """Print PowerShell health and return (PhysicalDrive number, reliability counters dict)."""
     dl = drive_letter.upper().rstrip("\\/").replace(":", "")
     if not dl or len(dl) != 1 or not dl.isalpha():
         print("[PS   ] Skipping PowerShell disk mapping (invalid drive letter).")
-        return None
+        return None, {}
 
     # Map drive letter -> Disk Number
     ps_map = (
@@ -93,9 +126,7 @@ def powershell_disk_health(drive_letter: str) -> Optional[int]:
         f"if ($p) {{ ($p | Get-Disk | Select-Object -First 1 Number).Number }} "
     )
     num = _run_powershell(ps_map)
-    disk_number = None
-    if num and num.strip().isdigit():
-        disk_number = int(num.strip())
+    disk_number = int(num.strip()) if (num and num.strip().isdigit()) else None
 
     # Show details
     ps_details = (
@@ -110,6 +141,7 @@ def powershell_disk_health(drive_letter: str) -> Optional[int]:
         print(details.strip())
 
     # Reliability counters (need admin on many systems; USB bridges may not expose)
+    reliability: Dict[str, Optional[int]] = {}
     if disk_number is not None:
         ps_rel = (
             f"$d = Get-Disk -Number {disk_number} -ErrorAction SilentlyContinue; "
@@ -123,6 +155,7 @@ def powershell_disk_health(drive_letter: str) -> Optional[int]:
         if rel and rel.strip():
             print("[PS   ] Storage reliability counters:")
             print(rel.strip())
+            reliability = _parse_ps_kv_block(rel)
         else:
             print(
                 "[PS   ] Reliability counters not available (non-admin or bridge doesn’t expose)."
@@ -130,7 +163,40 @@ def powershell_disk_health(drive_letter: str) -> Optional[int]:
     else:
         print("[PS   ] Could not map drive letter to a Disk Number.")
 
-    return disk_number
+    return disk_number, reliability
+
+
+def resolve_report_path(user_value: Optional[str], drive_letter: str) -> Optional[str]:
+    if not user_value:
+        return None
+
+    v = user_value.strip().strip('"').strip("'")
+    if not v:
+        return None
+
+    # Default base: script directory
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    drv = drive_letter.upper().rstrip(":\\/") or "X"
+    default_name = f"hdd_runs_{drv}.jsonl"
+
+    # Handle "y"/"yes" as "use default file in script dir"
+    if v.lower() in ("y", "yes", "true", "1"):
+        return os.path.join(script_dir, default_name)
+
+    # Expand env/user vars
+    path = os.path.expandvars(os.path.expanduser(v))
+
+    # If explicit directory (exists or trailing slash), drop file into it
+    if path.endswith(("\\", "/")) or os.path.isdir(path):
+        return os.path.join(path, default_name)
+
+    # If has a file extension and it's .json/.jsonl -> keep as file
+    root, ext = os.path.splitext(path)
+    if ext.lower() in (".json", ".jsonl"):
+        return path
+
+    # Otherwise treat it as a directory base and put default file in it
+    return os.path.join(path, default_name)
 
 
 # ---------- smartctl helpers (auto-discovery and USB device type retries) ----------
@@ -162,17 +228,24 @@ def find_smartctl(user_path: Optional[str] = None) -> Optional[str]:
     return None
 
 
+_SMART_OVERALL_PAT = re.compile(
+    r"SMART (?:overall-health|Health Status).*?:\s*([A-Z]+)", re.IGNORECASE
+)
+_SMART_ATTR_PAT = re.compile(r"^\s*(\d+)\s+([A-Za-z0-9_\-]+)\s+.*?(-?\d+)\s*(?:\(|$)")
+
+
 def smartctl_summary(
     drive_letter: str,
     disk_number_hint: Optional[int],
     smartctl_path: Optional[str] = None,
-) -> None:
+) -> Dict[str, object]:
+    """Print smartctl summary and return a parsed dict of key info."""
     sc = find_smartctl(smartctl_path)
     if not sc:
         print(
             "[SMART] smartctl not found. Install smartmontools or add it to PATH, or pass --smartctl <path>."
         )
-        return
+        return {}
 
     # Prefer PhysicalDriveN, then drive letter
     targets = []
@@ -184,7 +257,7 @@ def smartctl_summary(
     def _run(args):
         return subprocess.check_output([sc] + args, text=True, stderr=subprocess.STDOUT)
 
-    # For each target, try plain, then -d sat, then -d scsi
+    parsed: Dict[str, object] = {}
     for target in targets:
         for extra in ([], ["-d", "sat"], ["-d", "scsi"]):
             try:
@@ -193,6 +266,9 @@ def smartctl_summary(
                 trail = f" {' '.join(extra)}" if extra else ""
                 print(f"[SMART] smartctl on {target}{trail} (key lines):")
                 key_lines = []
+                overall = None
+                attrs: Dict[str, Dict[str, int]] = {}
+                temp_c: Optional[int] = None
                 for line in out.splitlines():
                     lat = line.strip()
                     if any(
@@ -212,20 +288,41 @@ def smartctl_summary(
                         ]
                     ):
                         key_lines.append(lat)
+                    # parse overall
+                    mo = _SMART_OVERALL_PAT.search(lat)
+                    if mo:
+                        overall = mo.group(1).upper()
+                    # parse attribute rows
+                    ma = _SMART_ATTR_PAT.match(lat)
+                    if ma:
+                        aid, name, raw = ma.groups()
+                        try:
+                            rawv = int(raw)
+                        except Exception:
+                            continue
+                        attrs[aid] = {"name": name, "raw": rawv}  # pyright: ignore[reportArgumentType]
+                        if name.lower().startswith("temperature"):
+                            temp_c = rawv
                 print(
                     "\n".join(key_lines[:60])
                     if key_lines
                     else "(Ran; no standard attributes detected)"
                 )
-                return
+                if overall:
+                    parsed["overall"] = overall
+                if temp_c is not None:
+                    parsed["temperature_celsius"] = temp_c
+                if attrs:
+                    parsed["attributes"] = attrs
+                return parsed
             except subprocess.CalledProcessError:
-                # Keep trying next mode
                 continue
             except Exception:
                 continue
     print(
         "[SMART] Could not read SMART via common methods (USB bridge may hide it). Try running as admin or a different enclosure."
     )
+    return parsed
 
 
 # -------------------------- I/O workers --------------------------
@@ -233,7 +330,7 @@ def smartctl_summary(
 
 def write_test_file(
     path: str, size_gb: float = 2.0, chunk_mb: int = 64, pattern: str = "random"
-) -> Tuple[str, float]:
+) -> Tuple[str, float, float, int]:
     total_bytes = int(size_gb * (1024**3))
     chunk_size = int(chunk_mb * (1024**2))
     chunk_size = max(chunk_size, 1 * 1024 * 1024)
@@ -256,10 +353,10 @@ def write_test_file(
     dt = time.perf_counter() - t0
     w_speed = wrote / dt / (1024**2)
     print(f"[WRITE] Wrote {human_bytes(wrote)} in {dt:.2f}s  →  {w_speed:.1f} MB/s")
-    return h.hexdigest(), w_speed
+    return h.hexdigest(), w_speed, dt, wrote
 
 
-def read_verify(path: str, chunk_mb: int = 64) -> Tuple[str, float]:
+def read_verify(path: str, chunk_mb: int = 64) -> Tuple[str, float, float, int]:
     size = os.path.getsize(path)
     h = hashlib.blake2b(digest_size=32)
     chunk_size = int(chunk_mb * (1024**2))
@@ -278,7 +375,7 @@ def read_verify(path: str, chunk_mb: int = 64) -> Tuple[str, float]:
     dt = time.perf_counter() - t0
     r_speed = read / dt / (1024**2)
     print(f"[READ ] Read {human_bytes(read)} in {dt:.2f}s  →  {r_speed:.1f} MB/s")
-    return h.hexdigest(), r_speed
+    return h.hexdigest(), r_speed, dt, read
 
 
 def random_reads(
@@ -427,6 +524,11 @@ def interactive_config(defaults: argparse.Namespace) -> argparse.Namespace:
     smartctl_path = _prompt(
         "Path to smartctl.exe (Enter to auto-detect)", defaults.smartctl or ""
     )
+    report_in = _prompt(
+        "Save results to JSON (path or 'y' for default; Enter to skip)",
+        getattr(defaults, "report_json", "") or "",
+    )
+    report_json = resolve_report_path(report_in, drive)
 
     ns = argparse.Namespace(
         drive=drive,
@@ -439,6 +541,7 @@ def interactive_config(defaults: argparse.Namespace) -> argparse.Namespace:
         random_first=random_first,
         file_name=file_name,
         smartctl=(smartctl_path if smartctl_path else None),
+        report_json=(report_json if report_json else None),
     )
     return ns
 
@@ -486,11 +589,24 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     ap.add_argument("--smartctl", help="Path to smartctl.exe (optional)")
     ap.add_argument(
+        "--report-json", help="Append one JSON object per run to this file (JSON Lines)"
+    )
+    ap.add_argument(
         "--no-interactive",
         action="store_true",
         help="Force non-interactive even if no args provided",
     )
     return ap
+
+
+def _write_report_json(path: str, obj: Dict[str, object]) -> None:
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    except Exception:
+        pass
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    print(f"[REPORT] Appended JSON to {path}")
 
 
 def main():
@@ -499,14 +615,16 @@ def main():
     # If no CLI args, drop into interactive prompts unless --no-interactive is given.
     if len(sys.argv) == 1:
         defaults = ap.parse_args([])  # get defaults
-        # In verify-only, random-first is a good default
-        defaults.random_first = True
+        defaults.random_first = True  # sensible default for verify-only
         args = interactive_config(defaults)
     else:
         args = ap.parse_args()
-        # If verify-only and user didn't specify --random-first, we default it to True
         if args.verify_only and "--random-first" not in sys.argv:
             args.random_first = True
+
+        # Normalize --report-json even when passed via CLI
+        if getattr(args, "report_json", None):
+            args.report_json = resolve_report_path(args.report_json, args.drive)
 
     print(f"=== External HDD Test v{__version__} ===")
     print(
@@ -518,22 +636,40 @@ def main():
     os.makedirs(test_dir, exist_ok=True)
     test_path = os.path.join(test_dir, args.file_name)
 
+    # capture disk usage snapshot for reporting
+    du_total, du_used, du_free = shutil.disk_usage(root)
     basic_disk_info(root)
 
     # PowerShell health + get PhysicalDrive number (if possible)
-    disk_number = powershell_disk_health(args.drive)
+    disk_number, ps_rel = powershell_disk_health(args.drive)
 
     # smartctl (if present)
-    smartctl_summary(args.drive, disk_number, args.smartctl)
+    smart_info = smartctl_summary(args.drive, disk_number, args.smartctl)
 
-    # Ensure enough free space for write step (unless verify-only)
-    if not args.verify_only:
-        total, used, free = shutil.disk_usage(root)
-        need = int(args.size_gb * (1024**3)) + (128 * 1024**2)
-        if free < need:
-            raise SystemExit(
-                f"Not enough free space on {root}. Need ~{human_bytes(need)}, have {human_bytes(free)}."
-            )
+    report: Dict[str, object] = {
+        "timestamp_local": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
+        "script_version": __version__,
+        "python_version": sys.version.split()[0],
+        "os": {
+            "system": platform.system(),
+            "release": platform.release(),
+            "version": platform.version(),
+        },
+        "drive": args.drive,
+        "file": test_path,
+        "mode": ("verify-only" if args.verify_only else "write-read"),
+        "params": {
+            "size_gb": args.size_gb,
+            "chunk_mb": args.chunk_mb,
+            "pattern": args.pattern,
+            "random_samples": args.random_samples,
+            "random_first": args.random_first if args.verify_only else False,
+            "keep": bool(args.keep),
+        },
+        "disk_usage_start": {"total": du_total, "used": du_used, "free": du_free},
+        "powershell": {"reliability": ps_rel},
+        "smart": smart_info or {},
+    }
 
     if args.verify_only:
         if not os.path.exists(test_path):
@@ -542,9 +678,10 @@ def main():
             )
         print("[MODE ] Verify-only: will hash existing file.")
         rr = None
-        # Run random probe BEFORE sequential read if requested
+        rr_phase = None
         if args.random_first:
             rr = random_reads(test_path, samples=args.random_samples, block_size=4096)
+            rr_phase = "pre-read"
             if rr:
                 print(
                     f"[RAND ] 4KiB reads (pre-read): avg {rr['avg_ms']:.2f} ms, p95 {rr['p95_ms']:.2f} ms, ~{rr['throughput_mb_s']:.2f} MB/s over {rr['samples']} samples"
@@ -552,12 +689,11 @@ def main():
             else:
                 print("[RAND ] Random-read probe skipped/insufficient data")
 
-        # Now do the sequential read+hash
-        got_hash, r_speed = read_verify(test_path, args.chunk_mb)
+        got_hash, r_speed, r_dt, r_bytes = read_verify(test_path, args.chunk_mb)
 
-        # If we didn't run random first, do it now (will likely be cached)
         if rr is None:
             rr = random_reads(test_path, samples=args.random_samples, block_size=4096)
+            rr_phase = "post-read"
             if rr:
                 print(
                     f"[RAND ] 4KiB reads: avg {rr['avg_ms']:.2f} ms, p95 {rr['p95_ms']:.2f} ms, ~{rr['throughput_mb_s']:.2f} MB/s over {rr['samples']} samples"
@@ -565,21 +701,39 @@ def main():
             else:
                 print("[RAND ] Random-read probe skipped/insufficient data")
 
-        # Cache heuristic notice
         if rr and rr.get("avg_ms", 0) < 0.15:
             print(
                 "\n[NOTE ] Extremely low random latencies suggest results may be cached by Windows."
             )
 
+        report.update(
+            {
+                "write": None,
+                "read": {
+                    "bytes": r_bytes,
+                    "seconds": r_dt,
+                    "mb_per_s": r_speed,
+                    "hash": got_hash,
+                },
+                "integrity": {
+                    "expected_hash": None,
+                    "actual_hash": got_hash,
+                    "ok": None,
+                },
+                "random_read": {"phase": rr_phase, **(rr or {})} if rr else None,
+            }
+        )
+
     else:
-        exp_hash, w_speed = write_test_file(
+        exp_hash, w_speed, w_dt, w_bytes = write_test_file(
             test_path, args.size_gb, args.chunk_mb, args.pattern
         )
-        got_hash, r_speed = read_verify(test_path, args.chunk_mb)
+        got_hash, r_speed, r_dt, r_bytes = read_verify(test_path, args.chunk_mb)
 
         print(f"[HASH ] Expected: {exp_hash}")
         print(f"[HASH ]   Actual: {got_hash}")
-        if exp_hash == got_hash:
+        ok = exp_hash == got_hash
+        if ok:
             print("[OK   ] Read-after-write checksum matches ✅  (data integrity good)")
         else:
             print(
@@ -607,6 +761,30 @@ def main():
                 "          3) Reboot and run with --verify-only --random-first on the existing file."
             )
 
+        report.update(
+            {
+                "write": {
+                    "bytes": w_bytes,
+                    "seconds": w_dt,
+                    "mb_per_s": w_speed,
+                    "hash": exp_hash,
+                    "pattern": args.pattern,
+                },
+                "read": {
+                    "bytes": r_bytes,
+                    "seconds": r_dt,
+                    "mb_per_s": r_speed,
+                    "hash": got_hash,
+                },
+                "integrity": {
+                    "expected_hash": exp_hash,
+                    "actual_hash": got_hash,
+                    "ok": ok,
+                },
+                "random_read": {"phase": "post-read", **(rr or {})} if rr else None,
+            }
+        )
+
     if not args.keep and not args.verify_only:
         try:
             os.remove(test_path)
@@ -614,6 +792,10 @@ def main():
                 os.rmdir(test_dir)
         except Exception:
             pass
+
+    # Write JSON report if requested
+    if args.report_json:
+        _write_report_json(args.report_json, report)
 
     print("\nTips:")
     print(
